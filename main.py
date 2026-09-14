@@ -44,7 +44,7 @@ def thread_capture(q12, stop_event, sdr):
             complex_signal = sdr_functions.decimate_and_filter(complex_centered)        # Decimación y filtrado de la señal a 1000 Hz
 
             try:
-                q12.put(complex_signal.copy(), timeout=0.5)
+                q12.put(complex_signal.copy(), timeout=0.5)     # Metemos 32 ms de la señal diezmada en la cola. La cola tiene como máximo 5 + 32 ms = 160 ms de señal.
             except queue.Full:
                 print("[ERROR] q12 llena: el detector no procesa suficientemente rápido")
                 stop_event.set()
@@ -60,16 +60,18 @@ def thread_capture(q12, stop_event, sdr):
             pass
 
 
-def thread_detector(q12, stop_event, ibp_tracker):
+def thread_detector(q12, q23, stop_event, ibp_tracker):
 
+    # Este hilo está siempre corriendo, y prosigue la ejecución a medida que el primer hilo deposita muestras en la cola.
     
     MatchedFilter = detector.LDMatchedFir(F_DECIMATED)     #Filtro adaptado para detectar la raya larga de 1 segundo de duración
+    muestras_intervalo = []       # Variable donde almacenaremos las muestras del posible identificador de raya larga
         
     try:
-        for k in range(int(5*SAMPLE_RATE_HZ/BLOCK_LEN)):      # 5 por el número de tramas en
+        for k in range(int(5*SAMPLE_RATE_HZ/BLOCK_LEN)):      # 5 por el número de bloques que hay en 1 segundo de captura (muestras/segundo / muestras/bloque)
             buffer = q12.get(timeout=1)
             aux= np.square(np.abs(buffer))
-            MFOut=MatchedFilter.Filtra(aux)     # MFOut es la energía acumulada en 1 segundo de la señal recibida, tras pasar por el filtro adaptado
+            MFOut=MatchedFilter.Filtra(aux)     # MFOut es un array de 32 valores, cada uno una suma móvil de 1000 muestras
     except Exception as e:
         print(f"[ERROR] Detector: {e}")
         return
@@ -80,9 +82,8 @@ def thread_detector(q12, stop_event, ibp_tracker):
 
     # Despreciamos los primeros 5 segundos de captura para estabilizar el filtro:
     
-
     NoiseFloor=np.mean(MFOut)       # Media de únicamente el último segundo de señal real capturada
-    print('NoiseFloor',NoiseFloor)
+    print('Umbral de detección "NoiseFloor":',NoiseFloor)
 
     Lmax=-1000      # Inicializamos el acumulador del máximo pico del filtro adaptado
     
@@ -97,14 +98,15 @@ def thread_detector(q12, stop_event, ibp_tracker):
     # está elevada durante un periodo, entonces la señal es más sospechosa de ser una 
     # detección real.
 
-    NF=2
-    AdTh=NF*NoiseFloor      #Umbral adaptativo para detección de raya larga
+    NF=20
+    AdTh=NF*NoiseFloor      #   "Adaptive Theshold": Umbral adaptativo para detección de raya larga
 
     while not stop_event.is_set():
         try:
             buffer = q12.get(timeout=1)
             NewBaliza=ibp_tracker.bindex        # Actualización de indice de baliza
             aux= np.square(np.abs(buffer))        # Cálculo de la magnitud al cuadrado de la señal recibida. Potencia
+            muestras_intervalo.append(aux.copy())       # Añadimos las muestras del bloque al array de muestras del identificador
             MFOut=MatchedFilter.Filtra(aux)     #Actualización de salida del filtro
             #Máximo del filtro adaptado
             Mymax=np.max(MFOut)     # Valor pico del último segundo filtrado
@@ -112,9 +114,9 @@ def thread_detector(q12, stop_event, ibp_tracker):
             #Máquina de estados
             
             if PastBaliza==NewBaliza:       #Seguimos en la misma baliza
-                CumMean=0.5*(CumMean+np.mean(MFOut))        #Media acumulada de la salida del filtro adaptado
+                CumMean=0.5*(CumMean+np.mean(MFOut))        #   Valor medio acumulado de la salida del filtro adaptado
                 if Mymax > Lmax:
-                    Lmax=Mymax        #Actualizo el máximo del filtro adaptado en esta baliza
+                    Lmax=Mymax        #Actualizo Lmax al valor máximo observado en el último segundo de salida del filtro adaptado
 
             else:       # Está transmitiendo la siguiente baliza, y podemos decidir si durante los
                         # 10 segundos de la baliza anterior hubo una detección de raya larga
@@ -134,8 +136,16 @@ def thread_detector(q12, stop_event, ibp_tracker):
                         f"ratio={ratio:.2f}"
                     )
 
-                    # Aquí podrías agregar código para registrar la detección, enviar una señal,
-                    # o cualquier otra acción que desees realizar cuando se detecte una baliza.
+                    muestras_decode = np.concatenate(muestras_intervalo)
+
+                    q23.put({
+                        "muestras": muestras_decode,
+                        "beacon_index": PastBaliza,
+                        "callsign_esperado": callsign,
+                        "country": country
+                    })       # Enviamos las muestras del identificador detectado a la cola de logging
+
+                    muestras_intervalo.clear()       # Vaciamos el buffer de muestras del identificador
 
                 else: #No supero el umbral no hay detección
                     # Actualizamos el umbral adaptativo para la siguiente baliza,
@@ -164,6 +174,7 @@ def thread_detector(q12, stop_event, ibp_tracker):
                 PastBaliza=NewBaliza
                 Lmax=Mymax
                 CumMean=0
+                muestras_intervalo.clear()       # Vaciamos el buffer de muestras del identificador
 
         except queue.Empty:
             print("LongDashTask: Timeout esperando datos")
@@ -174,24 +185,40 @@ def thread_detector(q12, stop_event, ibp_tracker):
             traceback.print_exc()
             break
 
-
-
-
-    # # # q23.put({
-    # # #     "identificador": identificador if detection["detected_raw"] else "",
-    # # #     "timestamp": detection["timestamp"],
-    # # #     "detected_raw": detection["detected_raw"],
-    # # #     "score": detection["score"],
-    # # #     "noise": detection["noise"],
-    # # #     "ratio": detection["ratio"],
-    # # #     "pos": detection["pos"]
-    # # # })
-    # q12.task_done()
-
     
 def thread_logger(q23, stop_event):
 
-    pass
+    while not stop_event.is_set() or not q23.empty():
+
+        try:
+            item = q23.get(timeout=0.5)
+
+        except queue.Empty:
+            continue
+
+        np.save(
+            f"captura_{item['callsign_esperado']}.npy",
+            item["muestras"]
+        )
+        resultado = decode_log.extraer_identificador(
+            item["muestras"],
+            fs=1000,
+            debug=True
+        )
+
+        recibido = resultado["identificador"]
+        esperado = item["callsign_esperado"]
+
+        correcto = recibido == esperado
+
+        print(
+            f"Esperado: {esperado} | "
+            f"Decodificado: {recibido} | "
+            f"Morse: {resultado['morse']} | "
+            f"OK: {correcto}"
+        )
+
+        q23.task_done()
 
 ###############################################################################################################
 
@@ -207,18 +234,20 @@ def main():
 
     # 1. Crear colas
     q12 = queue.Queue(maxsize=5)
+    q23 = queue.Queue(maxsize=5)
 
     # 2. Crear señal de parada
     stop_event = threading.Event()
 
     # 3. Crear threads
     t1 = threading.Thread(target=thread_capture, args=(q12, stop_event, sdr))
-    t2 = threading.Thread(target=thread_detector, args=(q12, stop_event, ibp_tracker))
+    t2 = threading.Thread(target=thread_detector, args=(q12, q23, stop_event, ibp_tracker))
+    t3 = threading.Thread(target=thread_logger, args=(q23, stop_event))
 
     # 4. Arrancarlos
     t1.start()
     t2.start()
-
+    t3.start()
     # 5. Mantener el programa vivo
     try:
         while not stop_event.is_set():
@@ -232,7 +261,7 @@ def main():
     # 7. Esperar a que terminen
     t1.join()
     t2.join()
-
+    t3.join()
 
 if __name__ == "__main__":
     main()
