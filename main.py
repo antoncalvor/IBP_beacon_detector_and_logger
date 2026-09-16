@@ -148,7 +148,6 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
         try:
 
             capture_time, buffer = q12.get(timeout=1)
-
             block_beacon = (ibp_tracker.get_beacon_index(capture_time))
 
             # ====================================================
@@ -162,21 +161,18 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                 # ============================================
 
                 if slot_blocks:
-
                     finished_slot = np.concatenate(slot_blocks)
 
                 else:
-
                     finished_slot = np.array([], dtype=float)
 
                 # Los últimos 2 segundos de este slot serán
                 # el pre-roll del siguiente.
+                
                 if len(finished_slot) > 0:
-
                     next_pre_roll = finished_slot[-PRE_ROLL_SAMPLES:].copy()
 
                 else:
-
                     next_pre_roll = np.array([], dtype=float)
 
                 # ============================================
@@ -186,21 +182,12 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                 if (slot_complete and len(finished_slot) > 0):
 
                     callsign, country = (IBP.ibp_beacons[current_beacon])
-
                     detected = (Lmax > AdTh)
-
                     ratio = (Lmax / NoiseFloor if NoiseFloor > 0 else 0)
 
                     if detected:
 
-                        print(
-                            f"!!! DETECCIÓN "
-                            f"[{current_beacon:02d}] "
-                            f"{callsign} ({country}) "
-                            f"Max={Lmax:.6f} "
-                            f"Umbral={AdTh:.6f} "
-                            f"ratio={ratio:.2f}"
-                        )
+                        print(f"!!! DETECCIÓN [{current_beacon:02d}] {callsign} ({country}) Max={Lmax:.6f} Umbral={AdTh:.6f} ratio={ratio:.2f}")
 
                         # ====================================
                         # BUFFER PARA DECODIFICADOR MORSE
@@ -211,26 +198,24 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                         # slot actual completo
 
                         if len(slot_pre_roll) > 0:
-
                             muestras_decode = (np.concatenate((slot_pre_roll, finished_slot)))
 
                         else:
-
                             muestras_decode = (finished_slot.copy())
 
                         # Posición REAL de Lmax dentro del
                         # array que recibe el decoder.
                         if Lmax_slot_sample is not None:
-
                             lmax_decode_offset = (len(slot_pre_roll) + Lmax_slot_sample)
 
                         else:
-
                             lmax_decode_offset = None
 
                         # Posición donde empieza nominalmente
                         # el slot actual dentro del buffer.
                         slot_boundary_offset = (len(slot_pre_roll))
+
+                        log_timestamp = datetime.now(timezone.utc).isoformat()
 
                         q23.put({
                             "muestras": muestras_decode,
@@ -239,13 +224,31 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                             "country": country,
                             "lmax_offset": lmax_decode_offset,
                             "slot_boundary_offset": slot_boundary_offset,
-                            "lmax": Lmax
+                            "lmax": Lmax,
+
+                            # Datos necesarios para escribir el CSV
+                            # después de la decodificación.
+                            "noise_floor": NoiseFloor,
+                            "threshold": AdTh,
+                            "timestamp_utc": log_timestamp
                         })
 
                     else:
 
-                        NoiseFloor = (0.9 * NoiseFloor + 0.1 * CumMean)
+                        # Primero registramos la detección negativa usando
+                        # EXACTAMENTE los valores con los que se tomó la decisión.
+                        decode_log.log_long_dash_result(
+                            beacon_index=current_beacon,
+                            callsign=callsign,
+                            country=country,
+                            detected=False,
+                            lmax=Lmax,
+                            noise_floor=NoiseFloor,
+                            threshold=AdTh,
+                            decoded_callsign=""
+                        )
 
+                        NoiseFloor = (0.9 * NoiseFloor + 0.1 * CumMean)
                         AdTh = (NF * NoiseFloor)
 
                         print(
@@ -257,16 +260,6 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                             f"Umbral={AdTh:.6f} "
                             f"Lmax={Lmax:.6f}"
                         )
-
-                    decode_log.log_long_dash_result(
-                        beacon_index=current_beacon,
-                        callsign=callsign,
-                        country=country,
-                        detected=detected,
-                        lmax=Lmax,
-                        noise_floor=NoiseFloor,
-                        threshold=AdTh
-                    )
 
                 # ============================================
                 # COMENZAR EL NUEVO SLOT
@@ -321,18 +314,14 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
             CumMean = 0.5 * (CumMean + np.mean(MFOut))
 
             if Mymax > Lmax:
-
                 Lmax = Mymax
-
                 Lmax_slot_sample = (block_start_in_slot + local_max_index)
 
         except queue.Empty:
-
             print("LongDashTask: Timeout esperando datos")
             break
 
         except Exception:
-
             import traceback
             traceback.print_exc()
             break
@@ -367,13 +356,19 @@ def thread_logger(q23, stop_event):
 
         correcto = recibido == esperado
 
-        print(
-            f"Esperado: {esperado} | "
-            f"Decodificado: {recibido} | "
-            f"Morse: {resultado['morse']} | "
-            f"OK: {correcto}"
+        decode_log.log_long_dash_result(
+            beacon_index=item["beacon_index"],
+            callsign=item["callsign_esperado"],
+            country=item["country"],
+            detected=True,
+            lmax=item["lmax"],
+            noise_floor=item["noise_floor"],
+            threshold=item["threshold"],
+            decoded_callsign=recibido,
+            timestamp_utc=item["timestamp_utc"]
         )
 
+        print(f"Esperado: {esperado} | Decodificado: {recibido} | Morse: {resultado['morse']} | OK: {correcto}")
         q23.task_done()
 
 ###############################################################################################################

@@ -81,12 +81,7 @@ def _rle(binaria):
     if len(binaria) == 0:
         return []
 
-    cambios = (
-        np.flatnonzero(
-            np.diff(binaria.astype(np.int8)) != 0
-        )
-        + 1
-    )
+    cambios = (np.flatnonzero(np.diff(binaria.astype(np.int8)) != 0) + 1)
 
     inicios = np.r_[0, cambios]
     finales = np.r_[cambios, len(binaria)]
@@ -141,10 +136,7 @@ def _eliminar_glitches(binaria, min_samples):
 
             # Un tramo muy corto entre dos estados iguales
             # es casi con seguridad un glitch.
-            if (
-                longitud < min_samples
-                and estado_anterior == estado_siguiente
-            ):
+            if (longitud < min_samples and estado_anterior == estado_siguiente):
 
                 inicio = posiciones[i]
                 fin = inicio + longitud
@@ -159,17 +151,9 @@ def _eliminar_glitches(binaria, min_samples):
     return resultado
 
 
-def extraer_identificador(
-    muestras,
-    fs=1000,
-    unidad_s=0.054,
-    debug=False
-):
+def extraer_identificador(muestras, fs=1000, unidad_s=0.054, debug=False):
 
-    potencia = np.asarray(
-        muestras,
-        dtype=float
-    ).ravel()
+    potencia = np.asarray(muestras, dtype=float).ravel()
 
     if len(potencia) < fs:
         return {
@@ -191,11 +175,7 @@ def extraer_identificador(
 
     kernel = np.ones(n) / n
 
-    potencia_suave = np.convolve(
-        potencia,
-        kernel,
-        mode="same"
-    )
+    potencia_suave = np.convolve(potencia, kernel, mode="same")
 
     # -------------------------------------------------------
     # 2. Pasamos a dB
@@ -203,9 +183,7 @@ def extraer_identificador(
 
     eps = np.finfo(float).tiny
 
-    potencia_db = 10 * np.log10(
-        potencia_suave + eps
-    )
+    potencia_db = 10 * np.log10(potencia_suave + eps)
 
     # -------------------------------------------------------
     # 3. Estimamos RUIDO
@@ -215,10 +193,7 @@ def extraer_identificador(
     # En la transmisión IBP ya deberían haber terminado
     # callsign + rayas largas.
 
-    n_ruido = min(
-        len(potencia_db),
-        int(0.8 * fs)
-    )
+    n_ruido = min(len(potencia_db), int(0.8 * fs))
 
     zona_ruido = potencia_db[-n_ruido:]
 
@@ -230,9 +205,7 @@ def extraer_identificador(
 
     # Sólo nos interesa el comienzo del slot, donde están
     # el callsign y la primera raya.
-    inicio = potencia_db[
-        :min(len(potencia_db), int(4.5 * fs))
-    ]
+    inicio = potencia_db[:min(len(potencia_db), int(4.5 * fs))]
 
     # Un percentil alto representa razonablemente el CW ON.
     senal_db = np.percentile(inicio, 95)
@@ -253,20 +226,13 @@ def extraer_identificador(
     # -------------------------------------------------------
 
     # Punto medio EN dB entre ruido y señal.
-    threshold = (
-        ruido_db +
-        0.5 * separacion_db
-    )
+    threshold = (ruido_db + 0.5 * separacion_db)
 
     # Histéresis de +-1 dB
     threshold_on = threshold + 1.0
     threshold_off = threshold - 1.0
 
-    binaria = _histeresis_db(
-        potencia_db,
-        threshold_off,
-        threshold_on
-    )
+    binaria = _histeresis_db(potencia_db, threshold_off, threshold_on)
 
     # -------------------------------------------------------
     # 6. Eliminación de glitches
@@ -276,14 +242,9 @@ def extraer_identificador(
 
     # Ningún elemento Morse real debería durar menos
     # de aproximadamente la mitad de una unidad.
-    min_glitch = int(
-        round(0.55 * unidad)
-    )
+    min_glitch = int(round(0.55 * unidad))
 
-    binaria = _eliminar_glitches(
-        binaria,
-        min_glitch
-    )
+    binaria = _eliminar_glitches(binaria, min_glitch)
 
     # -------------------------------------------------------
     # 7. Medimos duraciones
@@ -318,7 +279,6 @@ def extraer_identificador(
 
                 if actual:
                     morse_chars.append(actual)
-
                 break
 
             # Un pulso demasiado corto sigue siendo basura
@@ -372,10 +332,7 @@ def extraer_identificador(
     if actual:
         morse_chars.append(actual)
 
-    identificador = "".join(
-        MORSE_DICT.get(x, "?")
-        for x in morse_chars
-    )
+    identificador = "".join(MORSE_DICT.get(x, "?") for x in morse_chars)
 
     morse = " ".join(morse_chars)
 
@@ -388,37 +345,29 @@ def extraer_identificador(
             f"Muestras recibidas: {len(potencia)} "
             f"({len(potencia)/fs:.3f} s)"
         )
-
         print(
             f"Ruido: {ruido_db:.2f} dB"
         )
-
         print(
             f"Señal estimada: {senal_db:.2f} dB"
         )
-
         print(
             f"Separación: {separacion_db:.2f} dB"
         )
-
         print(
             f"Threshold OFF: {threshold_off:.2f} dB"
         )
-
         print(
             f"Threshold ON: {threshold_on:.2f} dB"
         )
-
         print(
             "ON [muestras]:",
             duraciones_on[:50]
         )
-
         print(
             "OFF [muestras]:",
             duraciones_off[:50]
         )
-
         print(
             "ON [ms]:",
             [
@@ -426,7 +375,6 @@ def extraer_identificador(
                 for x in duraciones_on[:50]
             ]
         )
-
         print(
             "OFF [ms]:",
             [
@@ -434,17 +382,14 @@ def extraer_identificador(
                 for x in duraciones_off[:50]
             ]
         )
-
         print(
             "Morse:",
             morse
         )
-
         print(
             "Identificador:",
             identificador
         )
-
         print("-----------------------------")
         print()
 
@@ -460,8 +405,6 @@ def extraer_identificador(
     }
 
 
-
-
 ########################################################################################################
 #  VALIDACIÓN DE LA DETECCIÓN
 
@@ -474,11 +417,16 @@ def log_long_dash_result(
     lmax,
     noise_floor,
     threshold,
+    decoded_callsign="",
+    timestamp_utc=None,
     filename="detecciones.csv"
 ):
     
     # Fecha y hora UTC en el instante de registrar el resultado
-    timestamp = datetime.now(timezone.utc).isoformat()
+    if timestamp_utc is None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+    else:
+        timestamp = timestamp_utc
 
     # Relación señal/ruido usada para analizar posteriormente el umbral
     ratio = lmax / noise_floor if noise_floor > 0 else 0
@@ -489,12 +437,7 @@ def log_long_dash_result(
         or os.path.getsize(filename) == 0
     )
 
-    with open(
-        filename,
-        "a",
-        newline="",
-        encoding="utf-8"
-    ) as f:
+    with open(filename, "a", newline="", encoding="utf-8") as f:
 
         fieldnames = [
             "timestamp_utc",
@@ -505,14 +448,11 @@ def log_long_dash_result(
             "lmax",
             "noise_floor",
             "threshold",
-            "ratio"
+            "ratio",
+            "decoded_callsign"
         ]
 
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames,
-            delimiter=";"
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
 
         if write_header:
             writer.writeheader()
@@ -526,5 +466,6 @@ def log_long_dash_result(
             "lmax": lmax,
             "noise_floor": noise_floor,
             "threshold": threshold,
-            "ratio": ratio
+            "ratio": ratio,
+            "decoded_callsign": decoded_callsign
         })
