@@ -27,24 +27,35 @@ SAMPLE_RATE_HZ = 250_000
 DEC_FAC = [5, 5, 5, 2]
 F_DECIMATED = SAMPLE_RATE_HZ / np.prod(DEC_FAC)     # Frecuencia de muestreo final tras decimación. En este caso 1000 Hz
 
-
 ###############################################################################################################
 
-
 def thread_capture(q12, stop_event, sdr):
-    global buffer
 
-    last_detection_time = 0
-    COOLDOWN_S = 8
+    decimator = sdr_functions.filter_decimator(DEC_FAC)     # Creamos el objeto decimador y filtrador de la señal
+
+    block_duration = BLOCK_LEN / SAMPLE_RATE_HZ
+
 
     try:
         while not stop_event.is_set():
             raw_iq_data = sdr_functions.get_data_block(sdr, BLOCK_LEN)      # Adquisición de muestras de la SDR
+
+            # Instante aproximado correspondiente al centro
+            # temporal del bloque que acabamos de adquirir.
+            capture_time = (time.time() - block_duration / 2)
+
+
             complex_centered = sdr_functions.bb_shift(raw_iq_data)      # Desplazamiento de la señal a DC
-            complex_signal = sdr_functions.decimate_and_filter(complex_centered)        # Decimación y filtrado de la señal a 1000 Hz
+            complex_signal = decimator.process(complex_centered)        # Decimación y filtrado de la señal a 1000 Hz
 
             try:
-                q12.put(complex_signal.copy(), timeout=0.5)     # Metemos 32 ms de la señal diezmada en la cola. La cola tiene como máximo 5 + 32 ms = 160 ms de señal.
+                q12.put((capture_time, complex_signal.copy()), timeout=0.5)     # Metemos 32 ms de la señal diezmada en la cola. La cola tiene como máximo 5 + 32 ms = 160 ms de señal.
+                if q12.qsize() >= 10:
+
+                    print(
+                        f"[WARN] q12 acumulando bloques: "
+                        f"{q12.qsize()}/50"
+                    )
             except queue.Full:
                 print("[ERROR] q12 llena: el detector no procesa suficientemente rápido")
                 stop_event.set()
@@ -65,11 +76,11 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
     # Este hilo está siempre corriendo, y prosigue la ejecución a medida que el primer hilo deposita muestras en la cola.
     
     MatchedFilter = detector.LDMatchedFir(F_DECIMATED)     #Filtro adaptado para detectar la raya larga de 1 segundo de duración
-    muestras_intervalo = []       # Variable donde almacenaremos las muestras del posible identificador de raya larga
-        
+            
     try:
         for k in range(int(5*SAMPLE_RATE_HZ/BLOCK_LEN)):      # 5 por el número de bloques que hay en 1 segundo de captura (muestras/segundo / muestras/bloque)
-            buffer = q12.get(timeout=1)
+            capture_time, buffer = q12.get(timeout=1)
+            last_capture_time = capture_time
             aux= np.square(np.abs(buffer))
             MFOut=MatchedFilter.Filtra(aux)     # MFOut es un array de 32 valores, cada uno una suma móvil de 1000 muestras
     except Exception as e:
@@ -86,6 +97,7 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
     print('Umbral de detección "NoiseFloor":',NoiseFloor)
 
     Lmax=-1000      # Inicializamos el acumulador del máximo pico del filtro adaptado
+    Lmax_sample = None
     
     PastBaliza=ibp_tracker.bindex       # Inicialización de indice de baliza pasada
     NewBaliza=ibp_tracker.bindex        # Inicialización de indice de baliza actual
@@ -98,89 +110,229 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
     # está elevada durante un periodo, entonces la señal es más sospechosa de ser una 
     # detección real.
 
-    NF=20
+    NF=2
     AdTh=NF*NoiseFloor      #   "Adaptive Theshold": Umbral adaptativo para detección de raya larga
 
+    current_beacon = ibp_tracker.get_beacon_index(
+        last_capture_time
+    )
+
+    slot_blocks = []
+    slot_sample_count = 0
+    Lmax = -np.inf
+    Lmax_slot_sample = None
+    CumMean = 0
+
+    # --------------------------------------------------------
+    # PRE-ROLL PARA EL DECODIFICADOR MORSE
+    # --------------------------------------------------------
+    #
+    # Conservamos los últimos 2 segundos del slot anterior.
+    # Esto evita cortar el comienzo del indicativo si existe
+    # un pequeño desfase entre reloj software y muestras RF.
+
+    PRE_ROLL_SECONDS = 2.0
+
+    PRE_ROLL_SAMPLES = int(PRE_ROLL_SECONDS * F_DECIMATED)
+
+    # Muestras anteriores al comienzo nominal del slot actual.
+    slot_pre_roll = np.array([], dtype=float)
+
+    # El primer slot será parcial porque hemos arrancado
+    # después de los 5 segundos de estabilización.
+    # Lo descartaremos.
+    slot_complete = False
+
     while not stop_event.is_set():
+
         try:
-            buffer = q12.get(timeout=1)
-            NewBaliza=ibp_tracker.bindex        # Actualización de indice de baliza
-            aux= np.square(np.abs(buffer))        # Cálculo de la magnitud al cuadrado de la señal recibida. Potencia
-            muestras_intervalo.append(aux.copy())       # Añadimos las muestras del bloque al array de muestras del identificador
-            MFOut=MatchedFilter.Filtra(aux)     #Actualización de salida del filtro
-            #Máximo del filtro adaptado
-            Mymax=np.max(MFOut)     # Valor pico del último segundo filtrado
 
-            #Máquina de estados
-            
-            if PastBaliza==NewBaliza:       #Seguimos en la misma baliza
-                CumMean=0.5*(CumMean+np.mean(MFOut))        #   Valor medio acumulado de la salida del filtro adaptado
-                if Mymax > Lmax:
-                    Lmax=Mymax        #Actualizo Lmax al valor máximo observado en el último segundo de salida del filtro adaptado
+            capture_time, buffer = q12.get(timeout=1)
 
-            else:       # Está transmitiendo la siguiente baliza, y podemos decidir si durante los
-                        # 10 segundos de la baliza anterior hubo una detección de raya larga
+            block_beacon = (ibp_tracker.get_beacon_index(capture_time))
 
-                detected = Lmax > AdTh  # Determinamos si hubo detección de raya larga en la baliza anterior
-                callsign, country = IBP.ibp_beacons[PastBaliza]
-                ratio = Lmax / NoiseFloor
+            # ====================================================
+            # CAMBIO DE SLOT
+            # ====================================================
 
-                if detected: # Se superó el umbral, hay detección
-                    txt = "!!! Positivo {} Max= {:.4f}"                    
+            if block_beacon != current_beacon:
 
-                    print(
-                        f"!!! DETECCIÓN [{PastBaliza:02d}] "
-                        f"{callsign} ({country}) "
-                        f"Max={Lmax:.6f} "
-                        f"Umbral={AdTh:.6f}"
-                        f"ratio={ratio:.2f}"
+                # ============================================
+                # SLOT QUE ACABA DE FINALIZAR
+                # ============================================
+
+                if slot_blocks:
+
+                    finished_slot = np.concatenate(slot_blocks)
+
+                else:
+
+                    finished_slot = np.array([], dtype=float)
+
+                # Los últimos 2 segundos de este slot serán
+                # el pre-roll del siguiente.
+                if len(finished_slot) > 0:
+
+                    next_pre_roll = finished_slot[-PRE_ROLL_SAMPLES:].copy()
+
+                else:
+
+                    next_pre_roll = np.array([], dtype=float)
+
+                # ============================================
+                # PROCESAR SLOT COMPLETO
+                # ============================================
+
+                if (slot_complete and len(finished_slot) > 0):
+
+                    callsign, country = (IBP.ibp_beacons[current_beacon])
+
+                    detected = (Lmax > AdTh)
+
+                    ratio = (Lmax / NoiseFloor if NoiseFloor > 0 else 0)
+
+                    if detected:
+
+                        print(
+                            f"!!! DETECCIÓN "
+                            f"[{current_beacon:02d}] "
+                            f"{callsign} ({country}) "
+                            f"Max={Lmax:.6f} "
+                            f"Umbral={AdTh:.6f} "
+                            f"ratio={ratio:.2f}"
+                        )
+
+                        # ====================================
+                        # BUFFER PARA DECODIFICADOR MORSE
+                        # ====================================
+                        #
+                        # pre-roll del slot anterior
+                        # +
+                        # slot actual completo
+
+                        if len(slot_pre_roll) > 0:
+
+                            muestras_decode = (np.concatenate((slot_pre_roll, finished_slot)))
+
+                        else:
+
+                            muestras_decode = (finished_slot.copy())
+
+                        # Posición REAL de Lmax dentro del
+                        # array que recibe el decoder.
+                        if Lmax_slot_sample is not None:
+
+                            lmax_decode_offset = (len(slot_pre_roll) + Lmax_slot_sample)
+
+                        else:
+
+                            lmax_decode_offset = None
+
+                        # Posición donde empieza nominalmente
+                        # el slot actual dentro del buffer.
+                        slot_boundary_offset = (len(slot_pre_roll))
+
+                        q23.put({
+                            "muestras": muestras_decode,
+                            "beacon_index": current_beacon,
+                            "callsign_esperado": callsign,
+                            "country": country,
+                            "lmax_offset": lmax_decode_offset,
+                            "slot_boundary_offset": slot_boundary_offset,
+                            "lmax": Lmax
+                        })
+
+                    else:
+
+                        NoiseFloor = (0.9 * NoiseFloor + 0.1 * CumMean)
+
+                        AdTh = (NF * NoiseFloor)
+
+                        print(
+                            f"Baliza "
+                            f"[{current_beacon:02d}] "
+                            f"{callsign} ({country}) "
+                            f"NoiseFloor="
+                            f"{NoiseFloor:.6f} "
+                            f"Umbral={AdTh:.6f} "
+                            f"Lmax={Lmax:.6f}"
+                        )
+
+                    decode_log.log_long_dash_result(
+                        beacon_index=current_beacon,
+                        callsign=callsign,
+                        country=country,
+                        detected=detected,
+                        lmax=Lmax,
+                        noise_floor=NoiseFloor,
+                        threshold=AdTh
                     )
 
-                    muestras_decode = np.concatenate(muestras_intervalo)
+                # ============================================
+                # COMENZAR EL NUEVO SLOT
+                # ============================================
 
-                    q23.put({
-                        "muestras": muestras_decode,
-                        "beacon_index": PastBaliza,
-                        "callsign_esperado": callsign,
-                        "country": country
-                    })       # Enviamos las muestras del identificador detectado a la cola de logging
+                current_beacon = block_beacon
 
-                    muestras_intervalo.clear()       # Vaciamos el buffer de muestras del identificador
+                new_callsign, new_country = (IBP.ibp_beacons[current_beacon])
 
-                else: #No supero el umbral no hay detección
-                    # Actualizamos el umbral adaptativo para la siguiente baliza,
-                    # usando una media ponderada del ruido observado y el umbral anterior:
-                    NoiseFloor=0.9*NoiseFloor+0.1*CumMean
-                    AdTh=NF*NoiseFloor
-
-                    print(
-                        f"Baliza [{PastBaliza:02d}] "
-                        f"{callsign} ({country}) "
-                        f"NoiseFloor={NoiseFloor:.6f} "
-                        f"Umbral={AdTh:.6f} "
-                        f"Lmax={Lmax:.6f}"
-                    )
-
-                decode_log.log_long_dash_result(
-                    beacon_index=PastBaliza,
-                    callsign=callsign,
-                    country=country,
-                    detected=detected,
-                    lmax=Lmax,
-                    noise_floor=NoiseFloor,
-                    threshold=AdTh
+                print(
+                    f"[{current_beacon:02d}] "
+                    f"Recibiendo: "
+                    f"{new_callsign} ({new_country})"
                 )
 
-                PastBaliza=NewBaliza
-                Lmax=Mymax
-                CumMean=0
-                muestras_intervalo.clear()       # Vaciamos el buffer de muestras del identificador
+                # El final del anterior pasa a ser el
+                # pre-roll del nuevo.
+
+                slot_pre_roll = next_pre_roll
+                slot_blocks = []
+                slot_sample_count = 0
+                Lmax = -np.inf
+                Lmax_slot_sample = None
+                CumMean = 0
+
+                # Tras haber observado una frontera,
+                # podemos considerar completo el siguiente.
+                slot_complete = True
+
+            # ====================================================
+            # ESTE BLOQUE YA SABEMOS A QUÉ SLOT PERTENECE
+            # ====================================================
+
+            aux = np.square(np.abs(buffer))
+
+            block_start_in_slot = slot_sample_count
+
+            slot_blocks.append(aux.copy())
+
+            slot_sample_count += len(aux)
+
+            # ====================================================
+            # DETECTOR DE RAYA LARGA
+            # ====================================================
+
+            MFOut = MatchedFilter.Filtra(aux)
+
+            local_max_index = int(np.argmax(MFOut))
+
+            Mymax = float(MFOut[local_max_index])
+
+            CumMean = 0.5 * (CumMean + np.mean(MFOut))
+
+            if Mymax > Lmax:
+
+                Lmax = Mymax
+
+                Lmax_slot_sample = (block_start_in_slot + local_max_index)
 
         except queue.Empty:
+
             print("LongDashTask: Timeout esperando datos")
             break
 
         except Exception:
+
             import traceback
             traceback.print_exc()
             break
@@ -196,15 +348,19 @@ def thread_logger(q23, stop_event):
         except queue.Empty:
             continue
 
-        np.save(
-            f"captura_{item['callsign_esperado']}.npy",
-            item["muestras"]
-        )
-        resultado = decode_log.extraer_identificador(
-            item["muestras"],
-            fs=1000,
-            debug=True
-        )
+        nombre_captura = (f"captura_{item['callsign_esperado']}_{time.time_ns()}.npy")
+
+        np.save(nombre_captura, item["muestras"])
+
+        print(f"[MORSE] Buffer decoder: {len(item['muestras'])} muestras = {len(item['muestras']) / F_DECIMATED:.3f} s")
+
+        print(f"[MORSE] Frontera nominal del slot en {item['slot_boundary_offset']} muestras = {item['slot_boundary_offset'] / F_DECIMATED:.3f} s")
+
+        if item["lmax_offset"] is not None:
+
+            print(f"[MORSE] Lmax real dentro del buffer en {item['lmax_offset']} muestras = {item['lmax_offset'] / F_DECIMATED:.3f} s")
+
+        resultado = decode_log.extraer_identificador(item["muestras"], fs=1000, debug=True)
 
         recibido = resultado["identificador"]
         esperado = item["callsign_esperado"]
@@ -229,11 +385,11 @@ def main():
 
     #Inicialización taks IBP
     ibp_tracker=IBP.IBP()
-    ibp_tracker.InitIBP()
-    time.sleep(2)
+    # # # # ibp_tracker.InitIBP()
+    # # # # time.sleep(2)
 
     # 1. Crear colas
-    q12 = queue.Queue(maxsize=5)
+    q12 = queue.Queue(maxsize=50)
     q23 = queue.Queue(maxsize=5)
 
     # 2. Crear señal de parada

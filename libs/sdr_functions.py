@@ -44,12 +44,12 @@ def bb_shift(complex_data):
     complex_centered = complex_data * exp_
     return complex_centered
 
-def decimate_and_filter(complex_data):
+# # # # # def decimate_and_filter(complex_data):
     
-    complex_dec = complex_data # Si no se ha desplazado a banda base
-    for i, M in enumerate(DEC_FAC):
-        complex_dec = signal.decimate(complex_dec, q=M, ftype='fir', zero_phase=True)    
-    return complex_dec
+# # # # #     complex_dec = complex_data # Si no se ha desplazado a banda base
+# # # # #     for i, M in enumerate(DEC_FAC):
+# # # # #         complex_dec = signal.decimate(complex_dec, q=M, ftype='fir', zero_phase=True)    
+# # # # #     return complex_dec
 
 def update_buffer(new_block, dec_block_len): # actualiza el buffer circular con un nuevo bloque de muestras
     
@@ -59,3 +59,25 @@ def update_buffer(new_block, dec_block_len): # actualiza el buffer circular con 
         raise ValueError(f"Esperaba {dec_block_len}, recibidas {len(new_block)}")
     buffer[:dec_block_len] = buffer[dec_block_len:]     # movemos la segunda mitad del buffer a la primera mitad
     buffer[dec_block_len:] = new_block                  # metemos el nuevo bloque en la segunda mitad del buffer
+
+
+class filter_decimator:
+    def __init__(self, factors):
+
+        self.stages = []
+
+        for M in factors:
+            taps = 20*M+1
+            h = signal.firwin(taps, 1/M, window='hamming')
+            zi = np.zeros(len(h)-1, dtype=np.complex128)
+            self.stages.append({'M': M, 'h': h, 'zi': zi})
+
+    def process(self, x):
+        y = np.asarray(x, dtype=np.complex128)
+
+        for stage in self.stages:
+            y, zf = signal.lfilter(stage['h'], 1.0, y, zi=stage['zi'])
+            stage['zi'] = zf
+            y = y[::stage['M']]
+
+        return y
