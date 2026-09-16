@@ -424,18 +424,21 @@ def log_long_dash_result(
     
     # Fecha y hora UTC en el instante de registrar el resultado
     if timestamp_utc is None:
-        timestamp = datetime.now(timezone.utc).isoformat()
+
+        timestamp = datetime.now(timezone.utc).strftime("%d%m%y_%H%M%S")
+
     else:
-        timestamp = timestamp_utc
+
+        # timestamp_utc llega desde main.py en formato ISO
+        dt = datetime.fromisoformat(timestamp_utc)
+
+        timestamp = dt.strftime("%d%m%y_%H%M%S")
 
     # Relación señal/ruido usada para analizar posteriormente el umbral
     ratio = lmax / noise_floor if noise_floor > 0 else 0
 
     # Comprobamos si hay que escribir la cabecera
-    write_header = (
-        not os.path.exists(filename)
-        or os.path.getsize(filename) == 0
-    )
+    write_header = (not os.path.exists(filename) or os.path.getsize(filename) == 0)
 
     with open(filename, "a", newline="", encoding="utf-8") as f:
 

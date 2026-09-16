@@ -9,6 +9,7 @@ import scipy
 import matplotlib
 import queue
 import threading
+import os
 from threading import Thread
 from threading import Event
 from rtlsdr import RtlSdr
@@ -71,10 +72,12 @@ def thread_capture(q12, stop_event, sdr):
             pass
 
 
-def thread_detector(q12, q23, stop_event, ibp_tracker):
+def thread_detector(q12, q23, stop_event, ibp_tracker, session_dir):
 
     # Este hilo está siempre corriendo, y prosigue la ejecución a medida que el primer hilo deposita muestras en la cola.
     
+    csv_path = os.path.join(session_dir,"detecciones.csv")
+
     MatchedFilter = detector.LDMatchedFir(F_DECIMATED)     #Filtro adaptado para detectar la raya larga de 1 segundo de duración
             
     try:
@@ -110,7 +113,7 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
     # está elevada durante un periodo, entonces la señal es más sospechosa de ser una 
     # detección real.
 
-    NF=2
+    NF=5
     AdTh=NF*NoiseFloor      #   "Adaptive Theshold": Umbral adaptativo para detección de raya larga
 
     current_beacon = ibp_tracker.get_beacon_index(
@@ -245,7 +248,8 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
                             lmax=Lmax,
                             noise_floor=NoiseFloor,
                             threshold=AdTh,
-                            decoded_callsign=""
+                            decoded_callsign="",
+                            filename=csv_path,
                         )
 
                         NoiseFloor = (0.9 * NoiseFloor + 0.1 * CumMean)
@@ -327,7 +331,9 @@ def thread_detector(q12, q23, stop_event, ibp_tracker):
             break
 
     
-def thread_logger(q23, stop_event):
+def thread_logger(q23, stop_event, session_dir):
+
+    csv_path = os.path.join(session_dir,"detecciones.csv")
 
     while not stop_event.is_set() or not q23.empty():
 
@@ -337,9 +343,15 @@ def thread_logger(q23, stop_event):
         except queue.Empty:
             continue
 
-        nombre_captura = (f"captura_{item['callsign_esperado']}_{time.time_ns()}.npy")
+        fecha_captura = datetime.fromisoformat(item["timestamp_utc"])
 
-        np.save(nombre_captura, item["muestras"])
+        fecha_str = fecha_captura.strftime("%d%m%y_%H%M%S")
+
+        nombre_archivo = (f"muestras_{item['callsign_esperado']}_{fecha_str}.npy")
+
+        ruta_captura = os.path.join(session_dir, nombre_archivo)
+
+        np.save(ruta_captura, item["muestras"])
 
         print(f"[MORSE] Buffer decoder: {len(item['muestras'])} muestras = {len(item['muestras']) / F_DECIMATED:.3f} s")
 
@@ -365,7 +377,8 @@ def thread_logger(q23, stop_event):
             noise_floor=item["noise_floor"],
             threshold=item["threshold"],
             decoded_callsign=recibido,
-            timestamp_utc=item["timestamp_utc"]
+            timestamp_utc=item["timestamp_utc"],
+            filename=csv_path,
         )
 
         print(f"Esperado: {esperado} | Decodificado: {recibido} | Morse: {resultado['morse']} | OK: {correcto}")
@@ -375,6 +388,20 @@ def thread_logger(q23, stop_event):
 
 
 def main():
+
+    # =========================================================
+    # CARPETA DE LA SESIÓN
+    # =========================================================
+
+    inicio_sesion = datetime.now()
+
+    nombre_sesion = inicio_sesion.strftime("sesion_%d%m%y_%H%M%S")
+
+    session_dir = os.path.join("grabaciones", nombre_sesion)
+
+    os.makedirs(session_dir, exist_ok=True)
+
+    print(f"[INFO] Carpeta de sesión: {session_dir}")
 
     sdr = sdr_functions.configure_sdr()
 
@@ -392,8 +419,8 @@ def main():
 
     # 3. Crear threads
     t1 = threading.Thread(target=thread_capture, args=(q12, stop_event, sdr))
-    t2 = threading.Thread(target=thread_detector, args=(q12, q23, stop_event, ibp_tracker))
-    t3 = threading.Thread(target=thread_logger, args=(q23, stop_event))
+    t2 = threading.Thread(target=thread_detector, args=( q12, q23, stop_event, ibp_tracker, session_dir))
+    t3 = threading.Thread(target=thread_logger, args=( q23, stop_event, session_dir))
 
     # 4. Arrancarlos
     t1.start()
